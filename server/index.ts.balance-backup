@@ -1,0 +1,1907 @@
+import http from 'node:http'
+import fs from 'node:fs'
+import path from 'node:path'
+import crypto from 'node:crypto'
+import { GoogleGenAI } from '@google/genai'
+import { metamaskIntegration } from './integrations/metamask'
+import {
+  getAvailableTools
+} from './integrations/connection-manager'
+
+import {
+  registerIntegration,
+  registerIntegrationDefinition,
+  getIntegration,
+  listIntegrations
+} from './integrations/registry'
+import {
+  validateToolInvocation,
+  executeToolInvocation
+} from './integrations/executor'
+import {
+  initializeProviders,
+  discoverProviders
+} from './providers'
+import { resolveIntent } from './intent-resolver'
+import { getProviderForOperation } from './providers/registry'
+import type { ExecutionPlan } from './execution-plan'
+import { validateExecutionPlan } from './execution-plan-validator'
+
+const PORT = Number(process.env.PORT || 8787)
+
+initializeProviders()
+
+const ONCHAIN_AI_MODEL = 'OnechainAI'
+const AI_PROVIDER = 'gemini'
+const AI_PROVIDER_MODEL = 'gemini-3.8-flash'
+
+const client = new GoogleGenAI({
+  apiKey: process.env.GEMINI_API_KEY
+})
+
+async function generateAIResponse(
+  context: Array<{ role: string; content: string }>,
+  systemInstruction: string
+) {
+  if (AI_PROVIDER !== 'gemini') {
+    throw new Error(
+      `Unsupported AI provider: ${AI_PROVIDER}`
+    )
+  }
+
+  const contents = context.map(item => ({
+    role: item.role === 'assistant' ? 'model' : 'user',
+    parts: [
+      {
+        text: item.content
+      }
+    ]
+  }))
+
+  let lastError: unknown = null
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      const response = await client.models.generateContent({
+        model: AI_PROVIDER_MODEL,
+        contents,
+        config: {
+          systemInstruction
+        }
+      })
+
+      return {
+        id: response.responseId || crypto.randomUUID(),
+        content: response.text || '',
+        provider: AI_PROVIDER,
+        providerModel: AI_PROVIDER_MODEL
+      }
+    } catch (error) {
+      lastError = error
+
+      if (attempt === 2) {
+        break
+      }
+
+      await new Promise(resolve =>
+        setTimeout(resolve, 500 * 2 ** attempt)
+      )
+    }
+  }
+
+  throw lastError instanceof Error
+    ? lastError
+    : new Error('AI provider request failed')
+}
+
+async function generateExecutionPlan(
+  message: string,
+  availableIntegrations: Array<{
+    name: string
+    handle: string
+    description: string
+  }>
+): Promise<ExecutionPlan> {
+  const integrationContext = availableIntegrations
+    .map(
+      integration =>
+        `${integration.handle}: ${integration.name} — ${integration.description}`
+    )
+    .join('\n')
+
+  const systemInstruction = `
+You are the planning layer for Phorva OnechainAI.
+
+Your job is to interpret the user's request and return ONLY a JSON execution plan.
+
+You do NOT execute anything.
+You do NOT claim an action was executed.
+You do NOT invent integrations, tools, providers, addresses, balances, prices, or transaction results.
+
+Available integrations:
+${integrationContext || 'None'}
+
+Return exactly this JSON shape:
+
+{
+  "intent": "short description of the user's intended action",
+  "operation": "generic operation name or null",
+  "provider": "integration handle or null",
+  "providerMode": "explicit" | "discovery" | "none",
+  "tool": "tool name or null",
+  "arguments": {}
+}
+
+Rules:
+- If the user explicitly names an integration/provider, preserve that choice.
+- If the user requests an action but does not specify a provider, use providerMode "discovery".
+- If no external action is being requested, use providerMode "none".
+- Never invent a tool name. Use null when the tool is not known yet.
+- Never decide authorization or verification requirements.
+- operation must be a generic capability such as "get_balance", "swap", "send_transaction", or null.
+- Never invent a tool name. Use null when the tool is not known yet.
+- If the request cannot yet be mapped to a generic operation, keep operation as null.
+- If the user explicitly names a provider, preserve it.
+- If the user does not name a provider, use providerMode "discovery" and provider null.
+- Return valid JSON only.
+`
+
+  let response: Awaited<
+    ReturnType<typeof client.models.generateContent>
+  > | null = null
+
+  let lastError: unknown = null
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      response = await client.models.generateContent({
+        model: AI_PROVIDER_MODEL,
+        contents: [
+          {
+            role: 'user',
+            parts: [
+              {
+                text: message
+              }
+            ]
+          }
+        ],
+        config: {
+          systemInstruction
+        }
+      })
+
+      break
+    } catch (error) {
+      lastError = error
+
+      if (attempt === 2) {
+        break
+      }
+
+      await new Promise(resolve =>
+        setTimeout(resolve, 500 * 2 ** attempt)
+      )
+    }
+  }
+
+  if (!response) {
+    throw lastError instanceof Error
+      ? lastError
+      : new Error('Execution planner request failed')
+  }
+
+  const raw = response.text?.trim() || ''
+
+  if (!raw) {
+    throw new Error('Execution planner returned an empty response')
+  }
+
+  let parsed: unknown
+
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    throw new Error('Execution planner returned invalid JSON')
+  }
+
+  if (
+    typeof parsed !== 'object' ||
+    parsed === null ||
+    Array.isArray(parsed)
+  ) {
+    throw new Error('Execution planner returned an invalid plan')
+  }
+
+  const plan = parsed as Record<string, unknown>
+
+  const providerMode =
+    plan.providerMode === 'explicit' ||
+    plan.providerMode === 'discovery' ||
+    plan.providerMode === 'none'
+      ? plan.providerMode
+      : 'none'
+
+  return {
+    intent:
+      typeof plan.intent === 'string'
+        ? plan.intent
+        : message,
+    operation:
+      typeof plan.operation === 'string'
+        ? plan.operation
+        : null,
+    provider:
+      typeof plan.provider === 'string'
+        ? plan.provider
+        : null,
+    providerMode,
+    tool:
+      typeof plan.tool === 'string'
+        ? plan.tool
+        : null,
+    arguments:
+      typeof plan.arguments === 'object' &&
+      plan.arguments !== null &&
+      !Array.isArray(plan.arguments)
+        ? plan.arguments as Record<string, unknown>
+        : {},
+    requiresAuthorization: false,
+    requiresVerification: false
+  }
+}
+
+const DATA_DIR = path.join(process.cwd(), 'server', 'data')
+const MEMORY_FILE = path.join(DATA_DIR, 'memory.json')
+
+fs.mkdirSync(DATA_DIR, { recursive: true })
+
+function loadMemoryStore(): Record<string, any> {
+  try {
+    if (!fs.existsSync(MEMORY_FILE)) {
+      fs.writeFileSync(MEMORY_FILE, '{}')
+    }
+
+    return JSON.parse(fs.readFileSync(MEMORY_FILE, 'utf8') || '{}')
+  } catch {
+    return {}
+  }
+}
+
+function saveMemoryStore(store: Record<string, any>) {
+  fs.writeFileSync(
+    MEMORY_FILE,
+    JSON.stringify(store, null, 2)
+  )
+}
+
+function sendJson(
+  res: http.ServerResponse,
+  status: number,
+  data: unknown
+) {
+  res.writeHead(status, {
+    'Content-Type': 'application/json',
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Headers': 'Content-Type',
+    'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS'
+  })
+
+  res.end(JSON.stringify(data))
+}
+
+function readBody(req: http.IncomingMessage): Promise<any> {
+  return new Promise((resolve, reject) => {
+    let body = ''
+
+    req.on('data', chunk => {
+      body += chunk
+    })
+
+    req.on('end', () => {
+      try {
+        resolve(JSON.parse(body || '{}'))
+      } catch (error) {
+        reject(error)
+      }
+    })
+
+    req.on('error', reject)
+  })
+}
+
+function getUserId(payload: any) {
+  if (
+    typeof payload.userId === 'string' &&
+    payload.userId.trim()
+  ) {
+    return payload.userId.trim()
+  }
+
+  return 'local-user'
+}
+
+registerIntegration(
+  metamaskIntegration,
+  {
+    name: 'MetaMask',
+    handle: '@metamask',
+    description: 'Wallet and on-chain access.',
+    connection: {
+      type: 'provider'
+    }
+  }
+)
+
+registerIntegrationDefinition({
+  name: 'Polymarket',
+  handle: '@polymarket',
+  description: 'Prediction markets.',
+  connection: {
+    type: 'account'
+  }
+})
+
+registerIntegrationDefinition({
+  name: 'Uniswap',
+  handle: '@uniswap',
+  description: 'Decentralized trading.',
+  connection: {
+    type: 'wallet'
+  }
+})
+
+registerIntegrationDefinition({
+  name: 'Aave',
+  handle: '@aave',
+  description: 'Lending and borrowing.',
+  connection: {
+    type: 'wallet'
+  }
+})
+
+registerIntegrationDefinition({
+  name: 'Morpho',
+  handle: '@morpho',
+  description: 'Permissionless lending markets.',
+  connection: {
+    type: 'wallet'
+  }
+})
+
+registerIntegrationDefinition({
+  name: 'Curve',
+  handle: '@curve',
+  description: 'Stablecoin and DeFi liquidity.',
+  connection: {
+    type: 'wallet'
+  }
+})
+
+registerIntegrationDefinition({
+  name: 'Aerodrome',
+  handle: '@aerodrome',
+  description: 'Base liquidity and trading.',
+  connection: {
+    type: 'wallet'
+  }
+})
+
+registerIntegrationDefinition({
+  name: 'Jupiter',
+  handle: '@jupiter',
+  description: 'Solana trading and routing.',
+  connection: {
+    type: 'wallet'
+  }
+})
+
+
+function ensureUser(store: Record<string, any>, userId: string) {
+  if (!store[userId]) {
+    store[userId] = {
+      memories: [],
+      conversations: {},
+      historyEnabled: true,
+      connectedApps: {}
+    }
+  }
+
+  if (!store[userId].connectedApps) {
+    store[userId].connectedApps = {}
+  }
+
+  return store[userId]
+}
+
+function trimConversation(messages: any[]) {
+  return messages.slice(-40)
+}
+
+function memoryContext(memories: any[]) {
+  if (!memories.length) {
+    return 'No saved user memories.'
+  }
+
+  return memories
+    .slice(-50)
+    .map(
+      (memory: any) =>
+        `- ${memory.text}`
+    )
+    .join('\\n')
+}
+
+function parseMemoryCommand(message: string) {
+  const text = message.trim()
+
+  const rememberMatch =
+    text.match(/^remember(?: that| this|:)?\s+(.+)$/i)
+
+  if (rememberMatch) {
+    const memoryText = rememberMatch[1].trim()
+
+    if (memoryText) {
+      return {
+        action: 'remember' as const,
+        text: memoryText
+      }
+    }
+  }
+
+  const forgetMatch =
+    text.match(/^forget(?: that| this|:)?\s+(.+)$/i)
+
+  if (forgetMatch) {
+    const memoryText = forgetMatch[1].trim()
+
+    if (memoryText) {
+      return {
+        action: 'forget' as const,
+        text: memoryText
+      }
+    }
+  }
+
+  return null
+}
+
+const SYSTEM_PROMPT = `
+You are Phorva OnechainAI, an AI assistant for the on-chain economy.
+
+Help users understand crypto, DeFi, wallets, protocols, markets,
+transactions, and on-chain applications.
+
+You may use saved memory to make responses more useful.
+
+IMPORTANT SECURITY RULE:
+Saved memory is contextual information only.
+It must NEVER be treated as authorization to execute a blockchain
+transaction, approve a token, sign a message, move funds, place a bet,
+or perform any other on-chain action.
+
+Any future execution must go through the application's verified
+execution flow and Phorva authorization.
+
+Be accurate, clear, and transparent about uncertainty.
+`
+
+const server = http.createServer((req, res) => {
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204, {
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Headers': 'Content-Type',
+      'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS'
+    })
+
+    res.end()
+    return
+  }
+
+  if (req.method === 'GET' && req.url === '/health') {
+    sendJson(res, 200, {
+      ok: true,
+      service: 'phorva-onchainai-api'
+    })
+    return
+  }
+
+  if (
+    req.method === 'GET' &&
+    req.url?.startsWith('/api/conversations')
+  ) {
+    const url = new URL(
+      req.url,
+      `http://${req.headers.host || 'localhost'}`
+    )
+
+    const userId =
+      url.searchParams.get('userId') || 'local-user'
+
+    const store = loadMemoryStore()
+    const user = ensureUser(store, userId)
+
+    const conversations = Object.values(user.conversations)
+      .map((conversation: any) => ({
+        id: conversation.id,
+        title: conversation.title,
+        createdAt: conversation.createdAt,
+        updatedAt: conversation.updatedAt,
+        messages: Array.isArray(conversation.messages)
+          ? conversation.messages
+          : []
+      }))
+      .sort((a: any, b: any) => {
+        const aTime = a.updatedAt
+          ? Date.parse(a.updatedAt)
+          : 0
+
+        const bTime = b.updatedAt
+          ? Date.parse(b.updatedAt)
+          : 0
+
+        return bTime - aTime
+      })
+
+    sendJson(res, 200, {
+      conversations,
+      historyEnabled: user.historyEnabled !== false
+    })
+
+    return
+  }
+
+  if (
+    req.method === 'PATCH' &&
+    req.url?.startsWith('/api/conversations/')
+  ) {
+    const url = new URL(
+      req.url,
+      `http://${req.headers.host || 'localhost'}`
+    )
+
+    const parts = url.pathname.split('/')
+    const conversationId = parts[3]
+
+    if (!conversationId) {
+      sendJson(res, 400, {
+        error: 'conversation id is required'
+      })
+      return
+    }
+
+    readBody(req)
+      .then(async payload => {
+        const title =
+          typeof payload.title === 'string'
+            ? payload.title.trim()
+            : ''
+
+        if (!title) {
+          sendJson(res, 400, {
+            error: 'title is required'
+          })
+          return
+        }
+
+        const userId = getUserId(payload)
+        const store = loadMemoryStore()
+        const user = ensureUser(store, userId)
+
+        if (!user.conversations[conversationId]) {
+          sendJson(res, 404, {
+            error: 'conversation not found'
+          })
+          return
+        }
+
+        user.conversations[conversationId].title = title
+
+        saveMemoryStore(store)
+
+        sendJson(res, 200, {
+          ok: true,
+          id: conversationId,
+          title
+        })
+      })
+      .catch(() => {
+        sendJson(res, 400, {
+          error: 'Invalid JSON'
+        })
+      })
+
+    return
+  }
+
+  if (
+    req.method === 'DELETE' &&
+    req.url?.startsWith('/api/conversations/')
+  ) {
+    const url = new URL(
+      req.url,
+      `http://${req.headers.host || 'localhost'}`
+    )
+
+    const parts = url.pathname.split('/')
+    const conversationId = parts[3]
+    const userId =
+      url.searchParams.get('userId') || 'local-user'
+
+    if (!conversationId) {
+      sendJson(res, 400, {
+        error: 'conversation id is required'
+      })
+      return
+    }
+
+    const store = loadMemoryStore()
+    const user = ensureUser(store, userId)
+
+    delete user.conversations[conversationId]
+
+    saveMemoryStore(store)
+
+    sendJson(res, 200, {
+      ok: true
+    })
+
+    return
+  }
+
+  if (
+    req.method === 'POST' &&
+    req.url?.startsWith('/api/conversations/') &&
+    req.url?.endsWith('/rewrite')
+  ) {
+    const url = new URL(
+      req.url,
+      `http://${req.headers.host || 'localhost'}`
+    )
+
+    const parts = url.pathname.split('/')
+    const conversationId = parts[3]
+
+    if (!conversationId) {
+      sendJson(res, 400, {
+        error: 'conversation id is required'
+      })
+      return
+    }
+
+    readBody(req)
+      .then(async payload => {
+        try {
+          const isTemporary = payload.temporary === true
+          const userId = getUserId(payload)
+
+          const suppliedMessages =
+            Array.isArray(payload.messages)
+              ? payload.messages
+                  .filter(
+                    (item: any) =>
+                      (item?.role === 'user' ||
+                        item?.role === 'assistant') &&
+                      typeof item?.content === 'string' &&
+                      item.content.trim()
+                  )
+                  .map((item: any) => ({
+                    role: item.role,
+                    content: item.content.trim()
+                  }))
+              : []
+
+          if (!suppliedMessages.length) {
+            sendJson(res, 400, {
+              error: 'messages are required'
+            })
+            return
+          }
+
+          const store = loadMemoryStore()
+          const user = ensureUser(store, userId)
+
+          if (
+            !isTemporary &&
+            !user.conversations[conversationId]
+          ) {
+            sendJson(res, 404, {
+              error: 'conversation not found'
+            })
+            return
+          }
+
+          const context = trimConversation(
+            suppliedMessages
+          )
+
+          if (integrationAuthorizationRequired) {
+            const answer =
+              `Authorization is required to use ${mentionedAdapter?.handle || integrationMention}. ` +
+              `Connect the integration from Apps before I can use its tools.`
+
+            if (isTemporary || !historyEnabled) {
+              context.push({
+                role: 'assistant',
+                content: answer
+              })
+            } else {
+              const conversation =
+                user.conversations[conversationId]
+
+              conversation.messages.push({
+                role: 'assistant',
+                content: answer,
+                createdAt: new Date().toISOString()
+              })
+
+              conversation.messages =
+                trimConversation(conversation.messages)
+
+              conversation.updatedAt =
+                new Date().toISOString()
+
+              saveMemoryStore(store)
+            }
+
+            sendJson(res, 200, {
+              id: crypto.randomUUID(),
+              conversationId,
+              role: 'assistant',
+              content: answer,
+              model: ONCHAIN_AI_MODEL,
+              tools: [],
+              execution: null
+            })
+
+            return
+          }
+
+          const integrationContext =
+            activeIntegration
+              ? `
+
+Active integration:
+${activeIntegration.name} (${activeIntegration.handle})
+
+Available tools:
+${getAvailableTools(
+  user.connectedApps,
+  activeIntegration
+)
+  .map(
+    tool =>
+      `- ${tool.name}: ${tool.description} [${tool.access}]`
+  )
+  .join('\n')}
+
+Integration rules:
+- You may reason about these tools and explain what action would be taken.
+- Read-only tools do not require Phorva transaction verification.
+- Write tools marked requiresVerification=true MUST NOT be executed directly.
+- Any state-changing blockchain action must pass through Phorva verification first.
+- Never claim a blockchain transaction, signature, approval, or other state-changing action was executed unless the application actually reports execution success.
+`
+              : ''
+
+          const response = await generateAIResponse(
+            context.map((item: any) => ({
+              role: item.role,
+              content: item.content
+            })),
+            SYSTEM_PROMPT +
+              '\n\nSaved user memory:\n' +
+              memoryContext(user.memories) +
+              integrationContext
+          )
+
+          const answer = response.content || ''
+
+          if (isTemporary) {
+            sendJson(res, 200, {
+              id: response.id,
+              conversationId,
+              role: 'assistant',
+              content: answer,
+              model: ONCHAIN_AI_MODEL,
+              tools: [],
+              execution: null
+            })
+
+            return
+          }
+
+          const conversation =
+            user.conversations[conversationId]
+
+          conversation.messages = [
+            ...context,
+            {
+              role: 'assistant',
+              content: answer,
+              createdAt: new Date().toISOString()
+            }
+          ]
+
+          conversation.messages =
+            trimConversation(conversation.messages)
+
+          conversation.updatedAt =
+            new Date().toISOString()
+
+          saveMemoryStore(store)
+
+          sendJson(res, 200, {
+            id: response.id,
+            conversationId,
+            role: 'assistant',
+            content: answer,
+            model: ONCHAIN_AI_MODEL,
+            tools: activeIntegration
+              ? getAvailableTools(
+                  user.connectedApps,
+                  activeIntegration
+                ).map(tool => tool.name)
+              : [],
+            execution: null
+          })
+        } catch (error) {
+          console.error(
+            'Conversation rewrite failed:',
+            error
+          )
+
+          sendJson(res, 500, {
+            error:
+              error instanceof Error
+                ? error.message
+                : 'Conversation rewrite failed'
+          })
+        }
+      })
+      .catch(() => {
+        sendJson(res, 400, {
+          error: 'Invalid JSON'
+        })
+      })
+
+    return
+  }
+
+  if (
+    req.method === 'POST' &&
+    req.url === '/api/internal/execution-plan'
+  ) {
+    readBody(req)
+      .then(async body => {
+        const message =
+          typeof body.message === 'string'
+            ? body.message.trim()
+            : ''
+
+        if (!message) {
+          sendJson(res, 400, {
+            error: 'Message is required'
+          })
+          return
+        }
+
+        try {
+          const userId = getUserId(body)
+          const store = loadMemoryStore()
+          const user = ensureUser(store, userId)
+
+          const plan = await generateExecutionPlan(
+            message,
+            listIntegrations()
+          )
+
+          const adapter = plan.provider
+            ? getIntegration(plan.provider)
+            : null
+
+          const validatedPlan = validateExecutionPlan(
+            plan,
+            adapter,
+            user.connectedApps
+          )
+
+          sendJson(res, 200, {
+            ok: true,
+            plan: validatedPlan
+          })
+        } catch (error) {
+          sendJson(res, 500, {
+            error:
+              error instanceof Error
+                ? error.message
+                : 'Execution planner failed'
+          })
+        }
+      })
+      .catch(() => {
+        sendJson(res, 400, {
+          error: 'Invalid JSON'
+        })
+      })
+
+    return
+  }
+
+  if (req.method === 'POST' && req.url === '/api/chat') {
+    readBody(req)
+      .then(async payload => {
+        try {
+          const message =
+            typeof payload.message === 'string'
+              ? payload.message.trim()
+              : ''
+
+          const isTemporary =
+            payload.temporary === true
+
+          const conversationId =
+            typeof payload.conversationId === 'string' &&
+            payload.conversationId.trim()
+              ? payload.conversationId.trim()
+              : crypto.randomUUID()
+
+          const userId = getUserId(payload)
+
+          if (!message) {
+            sendJson(res, 400, {
+              error: 'message is required'
+            })
+            return
+          }
+
+          const store = loadMemoryStore()
+          const user = ensureUser(store, userId)
+
+          const historyEnabled =
+            user.historyEnabled !== false
+
+          const catalogIntegrations = listIntegrations()
+
+          const resolvedIntent = resolveIntent(
+            message,
+            catalogIntegrations.map(
+              integration => integration.handle
+            )
+          )
+
+          const integrationMention =
+            resolvedIntent.provider || ''
+
+          const mentionedAdapter =
+            integrationMention
+              ? getIntegration(integrationMention)
+              : undefined
+
+          const activeIntegration =
+            mentionedAdapter &&
+            getAvailableTools(
+              user.connectedApps,
+              mentionedAdapter
+            ).length > 0
+              ? mentionedAdapter
+              : undefined
+
+          const integrationAuthorizationRequired =
+            Boolean(
+              mentionedAdapter &&
+              !activeIntegration
+            )
+
+          const memoryCommand = parseMemoryCommand(message)
+
+          if (memoryCommand && user.memoryEnabled !== false) {
+            if (memoryCommand.action === 'remember') {
+              const normalized = memoryCommand.text.toLowerCase()
+
+              const existing = user.memories.find(
+                (memory: any) =>
+                  memory.text.trim().toLowerCase() === normalized
+              )
+
+              if (!existing) {
+                user.memories.push({
+                  id: crypto.randomUUID(),
+                  text: memoryCommand.text,
+                  createdAt: new Date().toISOString()
+                })
+              }
+
+              saveMemoryStore(store)
+
+              sendJson(res, 200, {
+                id: crypto.randomUUID(),
+                conversationId,
+                role: 'assistant',
+                content: existing
+                  ? 'I already have that saved in memory.'
+                  : 'Got it. I’ll remember that.',
+                model: 'OnechainAI',
+                tools: ['memory'],
+                execution: null
+              })
+
+              return
+            }
+
+            if (memoryCommand.action === 'forget') {
+              const target = memoryCommand.text.toLowerCase()
+
+              const before = user.memories.length
+
+              user.memories = user.memories.filter(
+                (memory: any) => {
+                  const saved = memory.text.toLowerCase()
+
+                  return (
+                    saved !== target &&
+                    !saved.includes(target) &&
+                    !target.includes(saved)
+                  )
+                }
+              )
+
+              const removed = before !== user.memories.length
+
+              saveMemoryStore(store)
+
+              sendJson(res, 200, {
+                id: crypto.randomUUID(),
+                conversationId,
+                role: 'assistant',
+                content: removed
+                  ? 'Done. I removed that from memory.'
+                  : 'I couldn’t find a matching saved memory.',
+                model: 'OnechainAI',
+                tools: ['memory'],
+                execution: null
+              })
+
+              return
+            }
+          }
+
+          let context: Array<{
+            role: string
+            content: string
+          }>
+
+          if (isTemporary || !historyEnabled) {
+            const suppliedMessages =
+              Array.isArray(payload.messages)
+                ? payload.messages
+                    .filter(
+                      (item: any) =>
+                        (item?.role === 'user' ||
+                          item?.role === 'assistant') &&
+                        typeof item?.content === 'string' &&
+                        item.content.trim()
+                    )
+                    .map((item: any) => ({
+                      role: item.role,
+                      content: item.content.trim()
+                    }))
+                : []
+
+            context = trimConversation(
+              suppliedMessages
+            )
+
+            const last =
+              context[context.length - 1]
+
+            if (
+              !last ||
+              last.role !== 'user' ||
+              last.content !== message
+            ) {
+              context.push({
+                role: 'user',
+                content: message
+              })
+            }
+
+            context = trimConversation(context)
+          } else {
+            if (!user.conversations[conversationId]) {
+              const now = new Date().toISOString()
+
+              user.conversations[conversationId] = {
+                id: conversationId,
+                title: message.slice(0, 40),
+                createdAt: now,
+                updatedAt: now,
+                messages: []
+              }
+            }
+
+            const conversation =
+              user.conversations[conversationId]
+
+            conversation.messages.push({
+              role: 'user',
+              content: message,
+              createdAt: new Date().toISOString()
+            })
+
+            conversation.updatedAt =
+              new Date().toISOString()
+
+            context = trimConversation(
+              conversation.messages
+            )
+          }
+
+          if (
+            integrationAuthorizationRequired &&
+            mentionedAdapter
+          ) {
+            const answer =
+              `Authorization is required to use ${mentionedAdapter.name}. ` +
+              `Open Apps, select ${mentionedAdapter.name}, and authorize the integration first.`
+
+            if (isTemporary || !historyEnabled) {
+              context.push({
+                role: 'assistant',
+                content: answer
+              })
+            } else {
+              const conversation =
+                user.conversations[conversationId]
+
+              conversation.messages.push({
+                role: 'assistant',
+                content: answer,
+                createdAt: new Date().toISOString()
+              })
+
+              conversation.messages =
+                trimConversation(conversation.messages)
+
+              conversation.updatedAt =
+                new Date().toISOString()
+
+              saveMemoryStore(store)
+            }
+
+            sendJson(res, 200, {
+              id: crypto.randomUUID(),
+              conversationId,
+              role: 'assistant',
+              content: answer,
+              model: ONCHAIN_AI_MODEL,
+              tools: [],
+              execution: null
+            })
+
+            return
+          }
+
+          const integrationContext =
+            activeIntegration
+              ? [
+                  '',
+                  'Connected integration:',
+                  `Name: ${activeIntegration.name}`,
+                  `Handle: ${activeIntegration.handle}`,
+                  'Available tools:',
+                  ...getAvailableTools(
+                    user.connectedApps,
+                    activeIntegration
+                  ).map(
+                    tool =>
+                      `- ${tool.name}: ${tool.description} ` +
+                      `(access=${tool.access}, ` +
+                      `requiresVerification=${tool.requiresVerification})`
+                  ),
+                  '',
+                  'Integration security rules:',
+                  '- You may reason about the available integration tools.',
+                  '- Do not claim a tool was executed unless the application actually executed it.',
+                  '- Do not claim a transaction was signed, submitted, or confirmed unless the application provides that result.',
+                  '- Any state-changing action must pass through Phorva verification before wallet or signer execution.'
+                ].join('\n')
+              : ''
+
+          const aiSystemInstruction =
+            SYSTEM_PROMPT +
+            '\n\nSaved user memory:\n' +
+            memoryContext(user.memories) +
+            integrationContext
+
+          let answer = ''
+          let responseId = crypto.randomUUID()
+          const wantsNativeBalance =
+            /\\b(balance|how much (?:eth|ether)|my (?:eth|ether))\\b/i.test(message)
+
+          if (wantsNativeBalance) {
+            const wallet = payload.walletContext
+            const address =
+              wallet && typeof wallet.address === 'string'
+                ? wallet.address.trim()
+                : ''
+            const chainId =
+              wallet && typeof wallet.chainId === 'string'
+                ? wallet.chainId.trim().toLowerCase()
+                : ''
+
+            if (!/^0x[a-fA-F0-9]{40}$/.test(address)) {
+              answer =
+                'I can check your real native-token balance, but no wallet account is available to this page. Open OnechainAI in a wallet-enabled browser and connect your wallet first. I have not requested wallet access.'
+            } else {
+              const networks: Record<string, { namespace: string; chain: string; network: string; asset: string }> = {
+                '0x1': { namespace: 'evm', chain: 'ethereum', network: 'mainnet', asset: 'ETH' },
+                '0x2105': { namespace: 'evm', chain: 'base', network: 'mainnet', asset: 'ETH' },
+                '0xa4b1': { namespace: 'evm', chain: 'arbitrum', network: 'mainnet', asset: 'ETH' },
+                '0x89': { namespace: 'evm', chain: 'polygon', network: 'mainnet', asset: 'POL' }
+              }
+              const network = networks[chainId]
+
+              if (!network) {
+                answer =
+                  'I could not identify a supported network from the connected wallet. Switch to a supported EVM network and try again.'
+              } else {
+                const provider = getProviderForOperation(
+                  network,
+                  'get_balance'
+                )
+
+                if (!provider) {
+                  answer =
+                    'No configured RPC provider supports this network yet. The balance has not been guessed or simulated.'
+                } else {
+                  const result = await provider.request(
+                    network,
+                    { method: 'get_balance', params: [address] }
+                  )
+
+                  if (
+                    !result.ok ||
+                    typeof result.result !== 'string' ||
+                    !/^0x[0-9a-f]+$/i.test(result.result)
+                  ) {
+                    answer =
+                      'I could not retrieve the live balance from the RPC provider. Check the network RPC configuration and try again.'
+                  } else {
+                    const wei = BigInt(result.result)
+                    const unit = 10n ** 18n
+                    const whole = wei / unit
+                    const fraction = (wei % unit)
+                      .toString()
+                      .padStart(18, '0')
+                      .slice(0, 6)
+                      .replace(/0+$/, '')
+
+                    const formattedBalance =
+                      fraction ? whole.toString() + '.' + fraction : whole.toString()
+
+                    answer =
+                      'Live native-token balance: ' + formattedBalance + ' ' + network.asset +
+                      '\nNetwork: ' + network.chain + ' mainnet' +
+                      '\\nWallet: ' + address +
+                      '\\nSource: configured RPC provider. This is a read-only lookup; no transaction was signed or sent.'
+                  }
+                }
+              }
+            }
+          } else {
+            const response = await generateAIResponse(
+              context.map((item: any) => ({
+                role: item.role,
+                content: item.content
+              })),
+              aiSystemInstruction
+            )
+            answer = response.content || ''
+            responseId = response.id || responseId
+          }
+
+          if (isTemporary || !historyEnabled) {
+            context.push({
+              role: 'assistant',
+              content: answer
+            })
+          } else {
+            const conversation =
+              user.conversations[conversationId]
+
+            conversation.messages.push({
+              role: 'assistant',
+              content: answer,
+              createdAt: new Date().toISOString()
+            })
+
+            conversation.messages =
+              trimConversation(conversation.messages)
+
+            conversation.updatedAt =
+              new Date().toISOString()
+
+            saveMemoryStore(store)
+          }
+
+          sendJson(res, 200, {
+            id: responseId,
+            conversationId,
+            role: 'assistant',
+            content: answer,
+            model: ONCHAIN_AI_MODEL,
+            tools: [],
+            execution: null
+          })
+        } catch (error) {
+          console.error(
+            'OnechainAI request failed:',
+            error
+          )
+
+          sendJson(res, 500, {
+            error:
+              error instanceof Error
+                ? error.message
+                : 'AI request failed'
+          })
+        }
+      })
+      .catch(() => {
+        sendJson(res, 400, {
+          error: 'Invalid JSON'
+        })
+      })
+
+    return
+  }
+
+  if (
+    req.method === 'GET' &&
+    req.url?.startsWith('/api/memory')
+  ) {
+    const url = new URL(
+      req.url,
+      `http://${req.headers.host || 'localhost'}`
+    )
+
+    const userId =
+      url.searchParams.get('userId') || 'local-user'
+
+    const store = loadMemoryStore()
+    const user = ensureUser(store, userId)
+
+    sendJson(res, 200, {
+      enabled: user.memoryEnabled !== false,
+      memories: user.memories
+    })
+
+    return
+  }
+
+  if (
+    req.method === 'POST' &&
+    req.url === '/api/memory'
+  ) {
+    readBody(req)
+      .then(async payload => {
+        const text =
+          typeof payload.text === 'string'
+            ? payload.text.trim()
+            : ''
+
+        if (!text) {
+          sendJson(res, 400, {
+            error: 'memory text is required'
+          })
+          return
+        }
+
+        const userId = getUserId(payload)
+        const store = loadMemoryStore()
+        const user = ensureUser(store, userId)
+
+        const memory = {
+          id: crypto.randomUUID(),
+          text,
+          createdAt: new Date().toISOString()
+        }
+
+        user.memories.push(memory)
+
+        saveMemoryStore(store)
+
+        sendJson(res, 201, {
+          memory
+        })
+      })
+      .catch(() => {
+        sendJson(res, 400, {
+          error: 'Invalid JSON'
+        })
+      })
+
+    return
+  }
+
+  if (
+    req.method === 'POST' &&
+    req.url === '/api/memory/settings'
+  ) {
+    readBody(req)
+      .then(payload => {
+        const userId = getUserId(payload)
+        const store = loadMemoryStore()
+        const user = ensureUser(store, userId)
+
+        user.memoryEnabled =
+          payload.enabled !== false
+
+        saveMemoryStore(store)
+
+        sendJson(res, 200, {
+          enabled: user.memoryEnabled
+        })
+      })
+      .catch(() => {
+        sendJson(res, 400, {
+          error: 'Invalid JSON'
+        })
+      })
+
+    return
+  }
+
+  if (
+    req.method === 'GET' &&
+    req.url?.startsWith('/api/apps/tools')
+  ) {
+    const requestUrl = new URL(
+      req.url,
+      'http://localhost'
+    )
+
+    const handle = (
+      requestUrl.searchParams.get('handle') || ''
+    ).trim().toLowerCase()
+
+    if (!handle) {
+      sendJson(res, 400, {
+        error: 'Missing integration handle'
+      })
+
+      return
+    }
+
+    const adapter =
+      getIntegration(handle)
+
+    if (!adapter) {
+      sendJson(res, 404, {
+        error: 'Integration adapter not found'
+      })
+
+      return
+    }
+
+    const userId =
+      requestUrl.searchParams.get('userId') ||
+      'local-user'
+
+    const store = loadMemoryStore()
+    const user = ensureUser(store, userId)
+
+    const tools = getAvailableTools(
+      user.connectedApps,
+      adapter
+    )
+
+    if (!tools.length) {
+      sendJson(res, 401, {
+        error: 'Integration authorization required',
+        handle: adapter.handle
+      })
+
+      return
+    }
+
+    sendJson(res, 200, {
+      integration: {
+        name: adapter.name,
+        handle: adapter.handle
+      },
+      tools
+    })
+
+    return
+  }
+
+  if (
+    req.method === 'GET' &&
+    req.url === '/api/apps/catalog'
+  ) {
+    sendJson(res, 200, {
+      apps: listIntegrations()
+    })
+
+    return
+  }
+
+  if (
+    req.method === 'GET' &&
+    req.url?.startsWith('/api/providers/discover')
+  ) {
+    const url = new URL(
+      req.url,
+      'http://localhost'
+    )
+
+    const namespace =
+      url.searchParams.get('namespace')
+
+    const chain =
+      url.searchParams.get('chain')
+
+    const network =
+      url.searchParams.get('network')
+
+    const operation =
+      url.searchParams.get('operation')
+
+    const providers =
+      discoverProviders(
+        namespace && chain
+          ? {
+              namespace,
+              chain,
+              ...(network
+                ? { network }
+                : {})
+            }
+          : undefined,
+        operation || undefined
+      )
+
+    sendJson(res, 200, {
+      ok: true,
+      providers
+    })
+
+    return
+  }
+
+  if (
+    req.method === 'POST' &&
+    req.url === '/api/apps/tool-invoke'
+  ) {
+    readBody(req)
+      .then(async payload => {
+        try {
+          const userId = getUserId(payload)
+
+          const integration =
+            typeof payload.integration === 'string'
+              ? payload.integration.trim().toLowerCase()
+              : ''
+
+          const tool =
+            typeof payload.tool === 'string'
+              ? payload.tool.trim()
+              : ''
+
+          const toolArguments =
+            payload.arguments &&
+            typeof payload.arguments === 'object' &&
+            !Array.isArray(payload.arguments)
+              ? payload.arguments
+              : {}
+
+          if (!integration || !tool) {
+            sendJson(res, 400, {
+              error:
+                'integration and tool are required'
+            })
+            return
+          }
+
+          const adapter = getIntegration(integration)
+
+          if (!adapter) {
+            sendJson(res, 404, {
+              error:
+                'Integration adapter not found',
+              integration
+            })
+            return
+          }
+
+          const store = loadMemoryStore()
+          const user = ensureUser(store, userId)
+
+          const availableTools =
+            getAvailableTools(
+              user.connectedApps,
+              adapter
+            )
+
+          const discoveredTool =
+            availableTools.find(
+              item => item.name === tool
+            )
+
+          if (!discoveredTool) {
+            sendJson(res, 401, {
+              error:
+                'Tool is not available for this integration',
+              integration,
+              tool
+            })
+            return
+          }
+
+          const validation =
+            validateToolInvocation(
+              adapter,
+              {
+                integration,
+                tool,
+                arguments: toolArguments
+              }
+            )
+
+          if (!validation.ok) {
+            sendJson(res, 400, {
+              error: validation.error
+            })
+            return
+          }
+
+          const execution =
+            await executeToolInvocation(
+              adapter,
+              validation.tool,
+              {
+                integration,
+                tool,
+                arguments: toolArguments
+              },
+              {
+                userId,
+                network:
+                  payload.network &&
+                  typeof payload.network === 'object' &&
+                  !Array.isArray(payload.network)
+                    ? payload.network
+                    : undefined,
+                provider:
+                  payload.provider &&
+                  typeof payload.provider === 'object' &&
+                  !Array.isArray(payload.provider)
+                    ? payload.provider
+                    : undefined
+              }
+            )
+
+          sendJson(res, 200, {
+            ok: execution.ok,
+            invocation: {
+              integration,
+              tool,
+              arguments: toolArguments
+            },
+            tool: validation.tool,
+            execution
+          })
+        } catch (error) {
+          console.error(
+            'Tool invocation validation failed:',
+            error
+          )
+
+          sendJson(res, 500, {
+            error:
+              error instanceof Error
+                ? error.message
+                : 'Tool invocation failed'
+          })
+        }
+      })
+      .catch(() => {
+        sendJson(res, 400, {
+          error: 'Invalid JSON'
+        })
+      })
+
+    return
+  }
+
+  if (
+    req.method === 'GET' &&
+    req.url?.startsWith('/api/apps/connections')
+  ) {
+    const url = new URL(
+      req.url,
+      `http://${req.headers.host || 'localhost'}`
+    )
+
+    const userId =
+      url.searchParams.get('userId') ||
+      'local-user'
+
+    const store = loadMemoryStore()
+    const user = ensureUser(store, userId)
+
+    sendJson(res, 200, {
+      connections: user.connectedApps || {}
+    })
+
+    return
+  }
+
+  if (
+    req.method === 'POST' &&
+    req.url === '/api/apps/connect'
+  ) {
+    readBody(req)
+      .then(payload => {
+        const userId = getUserId(payload)
+        const app = payload.app
+
+        if (
+          !app ||
+          typeof app.handle !== 'string' ||
+          !app.handle.trim()
+        ) {
+          sendJson(res, 400, {
+            error: 'App handle is required'
+          })
+          return
+        }
+
+        const handle =
+          app.handle.trim().toLowerCase()
+
+        const name =
+          typeof app.name === 'string' &&
+          app.name.trim()
+            ? app.name.trim()
+            : handle
+
+        const store = loadMemoryStore()
+        const user = ensureUser(store, userId)
+
+        user.connectedApps[handle] = {
+          handle,
+          name,
+          authorized: true,
+          status: 'connected',
+          connectedAt:
+            new Date().toISOString()
+        }
+
+        saveMemoryStore(store)
+
+        sendJson(res, 200, {
+          connected:
+            user.connectedApps[handle]
+        })
+      })
+      .catch(() => {
+        sendJson(res, 400, {
+          error: 'Invalid JSON'
+        })
+      })
+
+    return
+  }
+
+  if (
+    req.method === 'POST' &&
+    req.url === '/api/apps/disconnect'
+  ) {
+    readBody(req)
+      .then(payload => {
+        const userId = getUserId(payload)
+
+        const handle =
+          typeof payload.handle === 'string'
+            ? payload.handle.trim().toLowerCase()
+            : ''
+
+        if (!handle) {
+          sendJson(res, 400, {
+            error: 'App handle is required'
+          })
+          return
+        }
+
+        const store = loadMemoryStore()
+        const user = ensureUser(store, userId)
+
+        if (user.connectedApps) {
+          delete user.connectedApps[handle]
+        }
+
+        saveMemoryStore(store)
+
+        sendJson(res, 200, {
+          disconnected: handle
+        })
+      })
+      .catch(() => {
+        sendJson(res, 400, {
+          error: 'Invalid JSON'
+        })
+      })
+
+    return
+  }
+
+  if (
+    req.method === 'POST' &&
+    req.url === '/api/conversations/settings'
+  ) {
+    readBody(req)
+      .then(payload => {
+        const userId = getUserId(payload)
+        const store = loadMemoryStore()
+        const user = ensureUser(store, userId)
+
+        user.historyEnabled =
+          payload.enabled !== false
+
+        saveMemoryStore(store)
+
+        sendJson(res, 200, {
+          enabled: user.historyEnabled
+        })
+      })
+      .catch(() => {
+        sendJson(res, 400, {
+          error: 'Invalid JSON'
+        })
+      })
+
+    return
+  }
+
+  if (
+    req.method === 'DELETE' &&
+    req.url?.startsWith('/api/memory/')
+  ) {
+    const url = new URL(
+      req.url,
+      `http://${req.headers.host || 'localhost'}`
+    )
+
+    const id = url.pathname.split('/').pop()
+    const userId =
+      url.searchParams.get('userId') || 'local-user'
+
+    const store = loadMemoryStore()
+    const user = ensureUser(store, userId)
+
+    user.memories = user.memories.filter(
+      (memory: any) => memory.id !== id
+    )
+
+    saveMemoryStore(store)
+
+    sendJson(res, 200, {
+      ok: true
+    })
+
+    return
+  }
+
+  sendJson(res, 404, {
+    error: 'not_found'
+  })
+})
+
+server.listen(PORT, () => {
+  console.log(
+    `Phorva OnechainAI API listening on http://localhost:${PORT}`
+  )
+})

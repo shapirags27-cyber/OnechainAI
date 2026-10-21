@@ -1,0 +1,149 @@
+{
+  "local-user": {
+    "memories": [
+      {
+        "id": "6b2372f3-6542-4963-a120-37b467a05ab9",
+        "text": "User prefers concise answers.",
+        "createdAt": "2026-10-07T22:25:56.673Z"
+      }
+    ],
+    "conversations": {
+      "52f7a3b7-a359-4041-831a-6cb176167b94": {
+        "id": "52f7a3b7-a359-4041-831a-6cb176167b94",
+        "title": "What is DeFi?",
+        "createdAt": "2026-10-08T00:01:55.153Z",
+        "updatedAt": "2026-10-08T00:02:05.138Z",
+        "messages": [
+          {
+            "role": "user",
+            "content": "What is DeFi?",
+            "createdAt": "2026-10-08T00:01:55.154Z"
+          },
+          {
+            "role": "assistant",
+            "content": "**DeFi (Decentralized Finance)** refers to financial applications built on public blockchains (like Ethereum or Solana) that operate without centralized intermediaries such as banks or brokers. \n\nInstead of relying on institutions, DeFi uses self-executing **smart contracts** to provide services like:\n\n* **Trading:** Swapping tokens via Decentralized Exchanges (e.g., Uniswap).\n* **Lending & Borrowing:** Depositing collateral to borrow or earn interest (e.g., Aave).\n* **Yield Generation:** Earning returns through staking or providing liquidity.\n\n**Key features:**\n* **Non-custodial:** You maintain full control of your private keys and assets.\n* **Permissionless:** Anyone with a crypto wallet can access it.\n* **Transparent:** All code and transactions are publicly verifiable on-chain.",
+            "createdAt": "2026-10-08T00:02:05.138Z"
+          }
+        ]
+      },
+      "f5b3551f-082b-48fc-9169-00b68a4f314e": {
+        "id": "f5b3551f-082b-48fc-9169-00b68a4f314e",
+        "title": "Explain smart contracts in one sentence.",
+        "createdAt": "2026-10-08T00:06:16.285Z",
+        "updatedAt": "2026-10-08T00:06:20.299Z",
+        "messages": [
+          {
+            "role": "user",
+            "content": "Explain smart contracts in one sentence.",
+            "createdAt": "2026-10-08T00:06:16.286Z"
+          },
+          {
+            "role": "assistant",
+            "content": "Smart contracts are self-executing programs stored on a blockchain that automatically run and enforce agreements when predetermined conditions are met, eliminating the need for intermediaries.",
+            "createdAt": "2026-10-08T00:06:20.299Z"
+          }
+        ]
+      },
+      "99341451-4a05-48db-9470-2f706b4f1d5a": {
+        "id": "99341451-4a05-48db-9470-2f706b4f1d5a",
+        "title": "What is a blockchain?",
+        "createdAt": "2026-10-08T00:11:09.555Z",
+        "updatedAt": "2026-10-08T00:11:15.610Z",
+        "messages": [
+          {
+            "role": "user",
+            "content": "What is a blockchain?",
+            "createdAt": "2026-10-08T00:11:09.556Z"
+          },
+          {
+            "role": "assistant",
+            "content": "A **blockchain** is a decentralized, digital ledger that securely and permanently records transactions across a network of computers. \n\nKey characteristics include:\n\n* **Blocks:** Batches of verified transaction data.\n* **Chain:** Cryptographic links connecting each block to the previous one in chronological order.\n* **Decentralization:** Maintained by multiple independent computers (nodes) rather than a central authority or server.\n* **Immutability:** Once data is written and confirmed, it cannot be altered or deleted.\n* **Consensus:** A shared protocol (like Proof of Work or Proof of Stake) that nodes use to agree on the valid state of the ledger.",
+            "createdAt": "2026-10-08T00:11:15.610Z"
+          }
+        ]
+      },
+      "1afe1c88-0867-4e8c-aee8-770c80251b3c": {
+        "id": "1afe1c88-0867-4e8c-aee8-770c80251b3c",
+        "title": "CHAT HISTORY ON TEST - this should be sa",
+        "createdAt": "2026-10-08T05:21:11.575Z",
+        "updatedAt": "2026-10-08T05:23:26.442Z",
+        "messages": [
+          {
+            "role": "user",
+            "content": "CHAT HISTORY ON TEST - this should be saved.",
+            "createdAt": "2026-10-08T05:21:11.576Z"
+          },
+          {
+            "role": "assistant",
+            "content": "Understood. This has been noted in our conversation history. How can I help you today?",
+            "createdAt": "2026-10-08T05:23:26.442Z"
+          }
+        ]
+      },
+      "ddc5f249-91da-40b5-bbcf-99c672b99ff5": {
+        "id": "ddc5f249-91da-40b5-bbcf-99c672b99ff5",
+        "title": "Persistence verification test.",
+        "createdAt": "2026-10-08T05:23:31.179Z",
+        "updatedAt": "2026-10-08T05:24:04.195Z",
+        "messages": [
+          {
+            "role": "user",
+            "content": "Persistence verification test.",
+            "createdAt": "2026-10-08T05:23:31.179Z"
+          },
+          {
+            "role": "assistant",
+            "content": "Persistence verified. Context and preferences (concise responses) are active. Ready to assist.",
+            "createdAt": "2026-10-08T05:24:04.195Z"
+          }
+        ]
+      },
+      "6c641315-b7bb-4d25-b05c-351ad8534cea": {
+        "id": "6c641315-b7bb-4d25-b05c-351ad8534cea",
+        "title": "@metamask show my balance",
+        "createdAt": "2026-10-08T06:31:32.188Z",
+        "updatedAt": "2026-10-08T06:31:32.189Z",
+        "messages": [
+          {
+            "role": "user",
+            "content": "@metamask show my balance",
+            "createdAt": "2026-10-08T06:31:32.188Z"
+          },
+          {
+            "role": "assistant",
+            "content": "Authorization is required to use MetaMask. Open Apps, select MetaMask, and authorize the integration first.",
+            "createdAt": "2026-10-08T06:31:32.189Z"
+          }
+        ]
+      },
+      "2a74c26b-5b9f-43dc-a5b0-ae06785527a8": {
+        "id": "2a74c26b-5b9f-43dc-a5b0-ae06785527a8",
+        "title": "Connect my wallet",
+        "createdAt": "2026-10-10T09:00:23.540Z",
+        "updatedAt": "2026-10-10T12:00:36.752Z",
+        "messages": [
+          {
+            "role": "user",
+            "content": "Connect my wallet",
+            "createdAt": "2026-10-10T09:00:23.541Z"
+          },
+          {
+            "role": "assistant",
+            "content": "To connect your wallet, please use the **\"Connect Wallet\"** button located in the application interface (typically in the top right corner). \n\nAs an AI assistant, I cannot directly access your browser extension or initiate wallet connections for you.",
+            "createdAt": "2026-10-10T12:00:36.752Z"
+          }
+        ]
+      }
+    },
+    "historyEnabled": true,
+    "connectedApps": {
+      "@metamask": {
+        "handle": "@metamask",
+        "name": "MetaMask",
+        "authorized": true,
+        "status": "connected",
+        "connectedAt": "2026-10-08T06:32:28.559Z"
+      }
+    }
+  }
+}
